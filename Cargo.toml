@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Minimal proc_macro for generating test functions from fixture files"
 license = "MIT"
-publish = false
+repository = "https://github.com/wado-lang/datatest-mini"
 
 [lib]
 proc-macro = true
