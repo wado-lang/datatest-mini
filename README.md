@@ -1,4 +1,4 @@
-# datatest-mini
+# datatest-mini [![crates.io](https://img.shields.io/crates/v/datatest-mini.svg)](https://crates.io/crates/datatest-mini)
 
 Minimal proc macro for generating test functions from fixture files. A lightweight drop-in replacement for [datatest-stable](https://crates.io/crates/datatest-stable).
 
