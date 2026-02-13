@@ -38,6 +38,30 @@ datatest_mini::harness! {
 }
 ```
 
+### Async tests
+
+```rust
+async fn run_async_test(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+datatest_mini::harness! {
+    // Uses #[tokio::test] by default
+    { test = run_async_test, root = "tests/fixtures", pattern = r"\.txt$", async },
+    // Custom attribute
+    { test = run_async_test, root = "tests/fixtures", pattern = r"\.txt$",
+      async, attr = r#"tokio::test(flavor = "multi_thread")"# },
+}
+```
+
+The `attr` parameter can also be used without `async` for sync tests with custom attributes:
+
+```rust
+datatest_mini::harness! {
+    { test = run_test, root = "tests/fixtures", pattern = r"\.txt$", attr = "googletest::test" },
+}
+```
+
 ## Parameters
 
 | Parameter | Description |
@@ -45,6 +69,8 @@ datatest_mini::harness! {
 | `test`    | Test function with signature `fn(&Path, &str) -> Result<(), Box<dyn Error>>` |
 | `root`    | Path to the fixture directory (relative to `Cargo.toml`) |
 | `pattern` | Regex pattern matched against relative file paths |
+| `async`   | *(optional)* Generate `async fn` tests. Defaults to `#[tokio::test]` |
+| `attr`    | *(optional)* Custom test attribute (e.g., `"tokio::test(flavor = \"multi_thread\")"`) |
 
 ## License
 
