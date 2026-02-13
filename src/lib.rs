@@ -17,6 +17,22 @@
 //!     { test = run_test, root = "tests/fixtures", pattern = r"^[^/]+\.wado$" },
 //! }
 //! ```
+//!
+//! # Async tests
+//!
+//! ```ignore
+//! async fn run_async_test(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+//!     Ok(())
+//! }
+//!
+//! datatest_mini::harness! {
+//!     // Uses #[tokio::test] by default
+//!     { test = run_async_test, root = "tests/fixtures", pattern = r"\.txt$", async },
+//!     // Custom attribute
+//!     { test = run_async_test, root = "tests/fixtures", pattern = r"\.txt$",
+//!       async, attr = r#"tokio::test(flavor = "multi_thread")"# },
+//! }
+//! ```
 
 use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 use regex::Regex;
@@ -34,11 +50,20 @@ use std::path::Path;
 /// ```ignore
 /// datatest_mini::harness! {
 ///     { test = test_fn, root = "path/to/fixtures", pattern = r"pattern" },
+///     { test = async_fn, root = "path/to/fixtures", pattern = r"pattern", async },
+///     { test = async_fn, root = "path/to/fixtures", pattern = r"pattern",
+///       async, attr = r#"tokio::test(flavor = "multi_thread")"# },
 /// }
 /// ```
 ///
 /// Multiple test sets can be specified by adding more entries.
 /// The test function name is used as the module name (e.g., `test_fn::file_name`).
+///
+/// # Optional parameters
+///
+/// - `async`: Generate `async fn` tests. Defaults to `#[tokio::test]` attribute.
+/// - `attr`: Custom test attribute (e.g., `"tokio::test(flavor = \"multi_thread\")"`).
+///   When used without `async`, generates sync tests with the specified attribute.
 ///
 /// # Panics
 ///
@@ -72,6 +97,8 @@ pub fn harness(input: TokenStream) -> TokenStream {
             &full_path,
             &regex,
             &entry.test_fn,
+            entry.is_async,
+            &entry.attr,
             &mut all_tests,
         );
     }
@@ -83,6 +110,8 @@ struct HarnessEntry {
     test_fn: String,
     root: String,
     pattern: String,
+    is_async: bool,
+    attr: Option<String>,
 }
 
 fn parse_harness_entries(input: TokenStream) -> Vec<HarnessEntry> {
@@ -111,12 +140,36 @@ fn parse_single_entry(stream: TokenStream) -> Option<HarnessEntry> {
     let mut test_fn = None;
     let mut root = None;
     let mut pattern = None;
+    let mut is_async = false;
+    let mut attr = None;
 
     let mut iter = stream.into_iter().peekable();
 
     while let Some(token) = iter.next() {
         if let TokenTree::Ident(ident) = token {
             let key = ident.to_string();
+
+            // Handle bare `async` flag (no `= value`)
+            if key == "async" {
+                is_async = true;
+                // Check if followed by `= "..."` for custom attribute
+                if let Some(TokenTree::Punct(p)) = iter.peek()
+                    && p.as_char() == '='
+                {
+                    // Consume `=` — this `async` has a value, treat as attr
+                    iter.next();
+                    if let Some(TokenTree::Literal(lit)) = iter.next() {
+                        attr = Some(parse_string_literal(&lit));
+                    }
+                }
+                // Skip comma
+                if let Some(TokenTree::Punct(p)) = iter.peek()
+                    && p.as_char() == ','
+                {
+                    iter.next();
+                }
+                continue;
+            }
 
             // Skip '='
             if let Some(TokenTree::Punct(p)) = iter.next()
@@ -142,6 +195,11 @@ fn parse_single_entry(stream: TokenStream) -> Option<HarnessEntry> {
                         pattern = Some(parse_string_literal(&lit));
                     }
                 }
+                "attr" => {
+                    if let Some(TokenTree::Literal(lit)) = iter.next() {
+                        attr = Some(parse_string_literal(&lit));
+                    }
+                }
                 _ => {}
             }
 
@@ -158,6 +216,8 @@ fn parse_single_entry(stream: TokenStream) -> Option<HarnessEntry> {
         test_fn: test_fn?,
         root: root?,
         pattern: pattern?,
+        is_async,
+        attr,
     })
 }
 
@@ -182,6 +242,8 @@ struct TestEntry {
     test_name: String,
     path: String,
     test_fn: String,
+    is_async: bool,
+    attr: Option<String>,
 }
 
 fn collect_matching_files(
@@ -189,6 +251,8 @@ fn collect_matching_files(
     current_path: &Path,
     pattern: &Regex,
     test_fn: &str,
+    is_async: bool,
+    attr: &Option<String>,
     tests: &mut Vec<TestEntry>,
 ) {
     let entries = match std::fs::read_dir(current_path) {
@@ -204,7 +268,7 @@ fn collect_matching_files(
 
         if path.is_dir() {
             // Recurse into subdirectories
-            collect_matching_files(base_path, &path, pattern, test_fn, tests);
+            collect_matching_files(base_path, &path, pattern, test_fn, is_async, attr, tests);
             continue;
         }
 
@@ -232,6 +296,8 @@ fn collect_matching_files(
             test_name,
             path: path.display().to_string(),
             test_fn: test_fn.to_string(),
+            is_async,
+            attr: attr.clone(),
         });
     }
 }
@@ -254,14 +320,31 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
         let mut module_tokens = Vec::new();
 
         for test in module_tests {
-            // #[test]
+            // Determine the test attribute:
+            //   - attr specified: use it as-is
+            //   - async without attr: #[tokio::test]
+            //   - sync without attr: #[test]
+            let attr_str = if let Some(ref attr) = test.attr {
+                attr.clone()
+            } else if test.is_async {
+                "tokio::test".to_string()
+            } else {
+                "test".to_string()
+            };
+
+            // #[attr_str]
             module_tokens.push(TokenTree::Punct(Punct::new('#', Spacing::Alone)));
             module_tokens.push(TokenTree::Group(Group::new(
                 Delimiter::Bracket,
-                TokenStream::from_iter([TokenTree::Ident(Ident::new("test", Span::call_site()))]),
+                attr_str.parse::<TokenStream>().unwrap_or_else(|e| {
+                    panic!("invalid attribute '{}': {}", attr_str, e);
+                }),
             )));
 
-            // fn test_NAME()
+            // async fn test_NAME() or fn test_NAME()
+            if test.is_async {
+                module_tokens.push(TokenTree::Ident(Ident::new("async", Span::call_site())));
+            }
             module_tokens.push(TokenTree::Ident(Ident::new("fn", Span::call_site())));
             module_tokens.push(TokenTree::Ident(Ident::new(
                 &test.test_name,
@@ -272,12 +355,12 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
                 TokenStream::new(),
             )));
 
-            // { super::test_fn(std::path::Path::new("PATH"), include_str!("PATH")).unwrap(); }
+            // Build the function call: super::test_fn(Path::new("PATH"), include_str!("PATH"))
             //
             // include_str! serves two purposes:
             // 1. Registers the file in rustc's dep-info for dependency tracking
             // 2. Embeds content at compile time, avoiding redundant runtime file reads
-            let body = TokenStream::from_iter([
+            let mut body_tokens: Vec<TokenTree> = vec![
                 TokenTree::Ident(Ident::new("super", Span::call_site())),
                 TokenTree::Punct(Punct::new(':', Spacing::Joint)),
                 TokenTree::Punct(Punct::new(':', Spacing::Alone)),
@@ -315,13 +398,27 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
                         )),
                     ]),
                 )),
-                TokenTree::Punct(Punct::new('.', Spacing::Alone)),
-                TokenTree::Ident(Ident::new("unwrap", Span::call_site())),
-                TokenTree::Group(Group::new(Delimiter::Parenthesis, TokenStream::new())),
-                TokenTree::Punct(Punct::new(';', Spacing::Alone)),
-            ]);
+            ];
 
-            module_tokens.push(TokenTree::Group(Group::new(Delimiter::Brace, body)));
+            // .await (for async tests, before .unwrap())
+            if test.is_async {
+                body_tokens.push(TokenTree::Punct(Punct::new('.', Spacing::Alone)));
+                body_tokens.push(TokenTree::Ident(Ident::new("await", Span::call_site())));
+            }
+
+            // .unwrap();
+            body_tokens.push(TokenTree::Punct(Punct::new('.', Spacing::Alone)));
+            body_tokens.push(TokenTree::Ident(Ident::new("unwrap", Span::call_site())));
+            body_tokens.push(TokenTree::Group(Group::new(
+                Delimiter::Parenthesis,
+                TokenStream::new(),
+            )));
+            body_tokens.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
+
+            module_tokens.push(TokenTree::Group(Group::new(
+                Delimiter::Brace,
+                TokenStream::from_iter(body_tokens),
+            )));
         }
 
         if module_name.is_empty() {
