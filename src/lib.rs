@@ -373,17 +373,16 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
                 TokenTree::Ident(Ident::new("read_to_string", Span::call_site())),
                 TokenTree::Group(Group::new(
                     Delimiter::Parenthesis,
-                    TokenStream::from_iter([TokenTree::Literal(Literal::string(
-                        &test.path,
-                    ))]),
+                    TokenStream::from_iter([TokenTree::Literal(Literal::string(&test.path))]),
                 )),
                 TokenTree::Punct(Punct::new('.', Spacing::Alone)),
                 TokenTree::Ident(Ident::new("expect", Span::call_site())),
                 TokenTree::Group(Group::new(
                     Delimiter::Parenthesis,
-                    TokenStream::from_iter([TokenTree::Literal(Literal::string(
-                        &format!("failed to read fixture file: {}", &test.path),
-                    ))]),
+                    TokenStream::from_iter([TokenTree::Literal(Literal::string(&format!(
+                        "failed to read fixture file: {}",
+                        &test.path
+                    )))]),
                 )),
                 TokenTree::Punct(Punct::new(';', Spacing::Alone)),
                 // super::test_fn(std::path::Path::new("PATH"), &__content)
