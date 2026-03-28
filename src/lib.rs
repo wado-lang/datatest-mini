@@ -9,7 +9,7 @@
 //!
 //! fn run_test(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
 //!     // path: absolute path to the fixture file
-//!     // content: file content embedded at compile time via include_str!
+//!     // content: file content read at runtime via std::fs::read_to_string
 //!     Ok(())
 //! }
 //!
@@ -40,8 +40,8 @@ use std::path::Path;
 
 // TODO: Use `proc_macro::tracked_path` to track fixture directories when it
 // stabilizes. This would allow detecting new/removed fixture files without
-// build.rs. Currently only content changes to existing files are tracked
-// (via include_str! in generated code).
+// build.rs. Currently, adding or removing fixture files may not trigger
+// recompilation automatically.
 
 /// Generate a test harness for fixture files.
 ///
@@ -355,12 +355,38 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
                 TokenStream::new(),
             )));
 
-            // Build the function call: super::test_fn(Path::new("PATH"), include_str!("PATH"))
-            //
-            // include_str! serves two purposes:
-            // 1. Registers the file in rustc's dep-info for dependency tracking
-            // 2. Embeds content at compile time, avoiding redundant runtime file reads
+            // Build the function body:
+            //   let __content = std::fs::read_to_string("PATH")
+            //       .expect("failed to read fixture file: PATH");
+            //   super::test_fn(Path::new("PATH"), &__content)
             let mut body_tokens: Vec<TokenTree> = vec![
+                // let __content = std::fs::read_to_string("PATH").expect("...");
+                TokenTree::Ident(Ident::new("let", Span::call_site())),
+                TokenTree::Ident(Ident::new("__content", Span::call_site())),
+                TokenTree::Punct(Punct::new('=', Spacing::Alone)),
+                TokenTree::Ident(Ident::new("std", Span::call_site())),
+                TokenTree::Punct(Punct::new(':', Spacing::Joint)),
+                TokenTree::Punct(Punct::new(':', Spacing::Alone)),
+                TokenTree::Ident(Ident::new("fs", Span::call_site())),
+                TokenTree::Punct(Punct::new(':', Spacing::Joint)),
+                TokenTree::Punct(Punct::new(':', Spacing::Alone)),
+                TokenTree::Ident(Ident::new("read_to_string", Span::call_site())),
+                TokenTree::Group(Group::new(
+                    Delimiter::Parenthesis,
+                    TokenStream::from_iter([TokenTree::Literal(Literal::string(
+                        &test.path,
+                    ))]),
+                )),
+                TokenTree::Punct(Punct::new('.', Spacing::Alone)),
+                TokenTree::Ident(Ident::new("expect", Span::call_site())),
+                TokenTree::Group(Group::new(
+                    Delimiter::Parenthesis,
+                    TokenStream::from_iter([TokenTree::Literal(Literal::string(
+                        &format!("failed to read fixture file: {}", &test.path),
+                    ))]),
+                )),
+                TokenTree::Punct(Punct::new(';', Spacing::Alone)),
+                // super::test_fn(std::path::Path::new("PATH"), &__content)
                 TokenTree::Ident(Ident::new("super", Span::call_site())),
                 TokenTree::Punct(Punct::new(':', Spacing::Joint)),
                 TokenTree::Punct(Punct::new(':', Spacing::Alone)),
@@ -387,15 +413,9 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
                         )),
                         // Comma separator
                         TokenTree::Punct(Punct::new(',', Spacing::Alone)),
-                        // Second arg: include_str!("PATH")
-                        TokenTree::Ident(Ident::new("include_str", Span::call_site())),
-                        TokenTree::Punct(Punct::new('!', Spacing::Alone)),
-                        TokenTree::Group(Group::new(
-                            Delimiter::Parenthesis,
-                            TokenStream::from_iter([TokenTree::Literal(Literal::string(
-                                &test.path,
-                            ))]),
-                        )),
+                        // Second arg: &__content
+                        TokenTree::Punct(Punct::new('&', Spacing::Alone)),
+                        TokenTree::Ident(Ident::new("__content", Span::call_site())),
                     ]),
                 )),
             ];
