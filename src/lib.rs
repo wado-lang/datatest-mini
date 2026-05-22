@@ -64,6 +64,30 @@ use std::path::Path;
 /// - `async`: Generate `async fn` tests. Defaults to `#[tokio::test]` attribute.
 /// - `attr`: Custom test attribute (e.g., `"tokio::test(flavor = \"multi_thread\")"`).
 ///   When used without `async`, generates sync tests with the specified attribute.
+/// - `ignore_if_env`: Env var name, or array of names. Mark the test `#[ignore]`
+///   if ANY of them is set.
+/// - `ignore_unless_env`: Env var name, or array of names. Mark the test
+///   `#[ignore]` unless ANY of them is set.
+///
+/// The env vars are read at *compile* time (macro expansion) and baked into a
+/// real `#[ignore = "..."]` attribute, so ignored tests show as `ignored` (not
+/// passing) and do no file I/O. Run them on demand with
+/// `cargo test -- --ignored` (only ignored) or `--include-ignored` (all) without
+/// rebuilding. Because the decision is compile-time, changing the env requires
+/// re-expanding the macro — `touch` the test file (or `cargo clean`) so Cargo
+/// re-runs it; `proc_macro::tracked_env` (which would auto-rebuild) is nightly
+/// only.
+///
+/// ```ignore
+/// datatest_mini::harness! {
+///     // Ignored unless CI or WADO_FULL_TEST is set at build time.
+///     { test = slow_test, root = "tests/fixtures", pattern = r"\.txt$",
+///       ignore_unless_env = ["CI", "WADO_FULL_TEST"] },
+///     // Ignored whenever DATATEST_MINI_SKIP is set at build time.
+///     { test = run_test, root = "tests/fixtures", pattern = r"\.txt$",
+///       ignore_if_env = "DATATEST_MINI_SKIP" },
+/// }
+/// ```
 ///
 /// # Panics
 ///
@@ -91,6 +115,12 @@ pub fn harness(input: TokenStream) -> TokenStream {
         let regex = Regex::new(&entry.pattern)
             .unwrap_or_else(|e| panic!("invalid pattern '{}': {}", entry.pattern, e));
 
+        // Decide whether this entry's tests are ignored, reading the env vars at
+        // macro-expansion (compile) time. The decision is baked into the
+        // generated `#[ignore]`; changing the env requires re-expanding the
+        // macro (e.g. `touch` the test file or `cargo clean`).
+        let ignore_reason = compute_ignore_reason(&entry.ignore_if_env, &entry.ignore_unless_env);
+
         // Use test function name as module name
         collect_matching_files(
             &full_path,
@@ -99,6 +129,7 @@ pub fn harness(input: TokenStream) -> TokenStream {
             &entry.test_fn,
             entry.is_async,
             &entry.attr,
+            &ignore_reason,
             &mut all_tests,
         );
     }
@@ -112,6 +143,12 @@ struct HarnessEntry {
     pattern: String,
     is_async: bool,
     attr: Option<String>,
+    /// Env var names; mark the test `#[ignore]` if ANY of them is set at
+    /// compile time.
+    ignore_if_env: Vec<String>,
+    /// Env var names; mark the test `#[ignore]` unless ANY of them is set at
+    /// compile time.
+    ignore_unless_env: Vec<String>,
 }
 
 fn parse_harness_entries(input: TokenStream) -> Vec<HarnessEntry> {
@@ -142,6 +179,8 @@ fn parse_single_entry(stream: TokenStream) -> Option<HarnessEntry> {
     let mut pattern = None;
     let mut is_async = false;
     let mut attr = None;
+    let mut ignore_if_env = Vec::new();
+    let mut ignore_unless_env = Vec::new();
 
     let mut iter = stream.into_iter().peekable();
 
@@ -200,6 +239,12 @@ fn parse_single_entry(stream: TokenStream) -> Option<HarnessEntry> {
                         attr = Some(parse_string_literal(&lit));
                     }
                 }
+                "ignore_if_env" => {
+                    ignore_if_env = parse_env_list(iter.next());
+                }
+                "ignore_unless_env" => {
+                    ignore_unless_env = parse_env_list(iter.next());
+                }
                 _ => {}
             }
 
@@ -218,6 +263,8 @@ fn parse_single_entry(stream: TokenStream) -> Option<HarnessEntry> {
         pattern: pattern?,
         is_async,
         attr,
+        ignore_if_env,
+        ignore_unless_env,
     })
 }
 
@@ -237,6 +284,24 @@ fn parse_string_literal(lit: &Literal) -> String {
     }
 }
 
+/// Parse an `ignore_if_env` / `ignore_unless_env` value: either a single string
+/// literal `"VAR"` or an array of string literals `["A", "B"]`. Returns the
+/// list of env var names (commas inside the array are ignored).
+fn parse_env_list(token: Option<TokenTree>) -> Vec<String> {
+    match token {
+        Some(TokenTree::Literal(lit)) => vec![parse_string_literal(&lit)],
+        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket => group
+            .stream()
+            .into_iter()
+            .filter_map(|t| match t {
+                TokenTree::Literal(lit) => Some(parse_string_literal(&lit)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 struct TestEntry {
     module_name: String,
     test_name: String,
@@ -244,8 +309,11 @@ struct TestEntry {
     test_fn: String,
     is_async: bool,
     attr: Option<String>,
+    /// `Some(reason)` to emit `#[ignore = "reason"]`; `None` for a normal test.
+    ignore_reason: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_matching_files(
     base_path: &Path,
     current_path: &Path,
@@ -253,6 +321,7 @@ fn collect_matching_files(
     test_fn: &str,
     is_async: bool,
     attr: &Option<String>,
+    ignore_reason: &Option<String>,
     tests: &mut Vec<TestEntry>,
 ) {
     let entries = match std::fs::read_dir(current_path) {
@@ -268,7 +337,16 @@ fn collect_matching_files(
 
         if path.is_dir() {
             // Recurse into subdirectories
-            collect_matching_files(base_path, &path, pattern, test_fn, is_async, attr, tests);
+            collect_matching_files(
+                base_path,
+                &path,
+                pattern,
+                test_fn,
+                is_async,
+                attr,
+                ignore_reason,
+                tests,
+            );
             continue;
         }
 
@@ -298,7 +376,42 @@ fn collect_matching_files(
             test_fn: test_fn.to_string(),
             is_async,
             attr: attr.clone(),
+            ignore_reason: ignore_reason.clone(),
         });
+    }
+}
+
+/// Decide, at macro-expansion (compile) time, whether an entry's tests should be
+/// marked `#[ignore]`, and with what reason.
+///
+/// - `ignore_if_env`: ignore when ANY listed var is set.
+/// - `ignore_unless_env`: ignore when NONE of the listed vars is set.
+///
+/// Returns `None` (run normally) when no condition triggers.
+fn compute_ignore_reason(ignore_if_env: &[String], ignore_unless_env: &[String]) -> Option<String> {
+    let mut reasons: Vec<String> = Vec::new();
+
+    let set_vars: Vec<&str> = ignore_if_env
+        .iter()
+        .filter(|v| std::env::var_os(v).is_some())
+        .map(String::as_str)
+        .collect();
+    if !set_vars.is_empty() {
+        reasons.push(format!("unset {} to run", set_vars.join("/")));
+    }
+
+    if !ignore_unless_env.is_empty()
+        && ignore_unless_env
+            .iter()
+            .all(|v| std::env::var_os(v).is_none())
+    {
+        reasons.push(format!("set {} to run", ignore_unless_env.join("/")));
+    }
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
     }
 }
 
@@ -340,6 +453,21 @@ fn generate_test_functions(tests: &[TestEntry]) -> TokenStream {
                     panic!("invalid attribute '{}': {}", attr_str, e);
                 }),
             )));
+
+            // #[ignore = "reason"] when ignore_if_env / ignore_unless_env apply.
+            // Emitted after the test attribute so it composes with #[test] and
+            // #[tokio::test] (both honor #[ignore]).
+            if let Some(reason) = &test.ignore_reason {
+                module_tokens.push(TokenTree::Punct(Punct::new('#', Spacing::Alone)));
+                module_tokens.push(TokenTree::Group(Group::new(
+                    Delimiter::Bracket,
+                    TokenStream::from_iter([
+                        TokenTree::Ident(Ident::new("ignore", Span::call_site())),
+                        TokenTree::Punct(Punct::new('=', Spacing::Alone)),
+                        TokenTree::Literal(Literal::string(reason)),
+                    ]),
+                )));
+            }
 
             // async fn test_NAME() or fn test_NAME()
             if test.is_async {
